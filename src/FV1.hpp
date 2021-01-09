@@ -24,6 +24,8 @@
 //http://www.spinsemi.com/knowledge_base/inst_syntax.html
 //http://www.spinsemi.com/forum/viewtopic.php?f=3&t=110&p=2227&hilit=CHO#p2227
 
+#pragma once
+
 #include <assert.h>
 #include <string>
 #include <vector>
@@ -50,8 +52,8 @@ const int OP_RMPA = 0x01;
 const int OP_WRA = 0x02;
 const int OP_WRAP = 0x03;
 const int OP_WLDS = 0x12;
-const int OP_WLDR = 0x40000013;
-const int OP_JAM = 0x00000413;
+const int OP_WLDR = 0x40000012;
+const int OP_JAM = 0x13;
 const int OP_CHO_RDA = 0x00000014;
 const int OP_CHO_SOF = 0x80000014;
 const int OP_CHO_RDAL = 0xc0000014;
@@ -151,7 +153,7 @@ public:
 
     void set(int newValue)
     {
-        value = clamp(newValue, -F, F - 1);
+        value = clamp(newValue, -(F << 1), (F << 1) - 1);
     }
 
     static int fixSign(int newValue)
@@ -165,6 +167,17 @@ public:
     static FixedPoint mul(FixedPoint a, FixedPoint b, int scale = 1)
     {
         return FixedPoint(((long long)a.getValue() * (long long)b.getValue() * scale) / FixedPoint::F);
+    }
+};
+
+struct OP
+{
+    std::vector<int> _args;
+    OP(std::initializer_list<int> args) : _args(args) {}
+
+    int const &operator[](int index) const
+    {
+        return _args[index];
     }
 };
 
@@ -359,7 +372,7 @@ private:
     SinLFO sinLFO[2] = {};
     RampLFO rampLFO[2] = {};
     bool firstRun = true;
-    std::vector<std::vector<int>> prog;
+    std::vector<OP> prog;
 
     int ACC()
     {
@@ -841,7 +854,7 @@ public:
         outR = this->REG(DACR).toFloat();
     }
 
-    void loadFx(const std::vector<std::vector<int>> &prog)
+    void loadFx(const std::vector<OP> &prog)
     {
         this->prog = prog;
 

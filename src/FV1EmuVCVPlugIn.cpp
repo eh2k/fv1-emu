@@ -376,7 +376,7 @@ struct FV1EmuModule : Module
             {
                 std::size_t found = name.find(".spn", name.length() - 5);
                 if (found == std::string::npos)
-                    found = name.find(".spn", name.length() - 5);
+                    found = name.find(".bin", name.length() - 5);
 
                 if (found != std::string::npos)
                 {
@@ -456,7 +456,7 @@ struct OpenSpnMenuItem : MenuItem
     void onAction(const event::Action &e) override
     {
         auto dir = module->lastPath.empty() ? asset::user("") : string::directory(module->lastPath);
-        auto *filters = osdialog_filters_parse("FV1-FX Asm:spn");
+        auto *filters = osdialog_filters_parse("FV1-FX Asm (*.spn):spn;FV1-FX Bin (*.bin):bin");
         char *path = osdialog_file(OSDIALOG_OPEN, dir.c_str(), NULL, filters);
         if (path)
         {

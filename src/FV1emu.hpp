@@ -29,6 +29,7 @@
 #include <codecvt>
 
 #include "FV1.hpp"
+#include "FV1dasm.hpp"
 
 class FV1emu
 {
@@ -235,7 +236,7 @@ private:
         while (tmp.tellp() < 4)
             tmp << " ";
 
-        tmp << op << " " << p1 << " " << p2 << " " << p3;
+        tmp << op << " 0x" << std::hex << p1 << " 0x" << std::hex << p2 << " 0x" << std::hex << p3;
 
         while (tmp.tellp() < 40)
             tmp << " ";
@@ -244,7 +245,7 @@ private:
 
         if (!line.empty())
         {
-            log << tmp.str();
+            log << tmp.str() << std::endl;
         }
     }
 
@@ -356,36 +357,55 @@ public:
     {
         std::stringstream stream;
 
-        FILE *pFile = fopen(file.c_str(), "r");
+        FILE *pFile = fopen(file.c_str(), "r+b");
         if (pFile)
         {
-            std::string line;
-            char buf[1024];
-            while (fgets(buf, 1024, pFile))
-            {
-                line.assign(buf);
-                bool isComment = false;
-
-                for (auto &c : line)
-                {
-                    if (c != 0 && isascii(c))
-                    {
-                        stream << (char)c;
-
-                        if (c == ';')
-                            isComment = true;
-
-                        if (isComment == false && c == ':')
-                            stream << std::endl;
-                    }
-                }
-
-                stream << std::endl;
-            }
-
             auto fxname = basename(file);
             toupper(fxname);
-            fclose(pFile);
+
+            if (file.find(".bin", file.size() - 4) != std::string::npos)
+            {
+                this->display = basename(file);
+                int op;
+                while(fread(&op, sizeof(int), 1, pFile))
+                {   
+                    op = __builtin_bswap32(op);
+                    auto o = dasmOP(op);
+                    char tmp[100];
+                    printOP(o, tmp);
+                    stream << tmp << std::endl;
+                }
+                fclose(pFile);
+            }
+            else
+            {
+                std::string line;
+                char buf[1024];
+                while (fgets(buf, 1024, pFile))
+                {
+                    line.assign(buf);
+                    bool isComment = false;
+
+                    for (auto &c : line)
+                    {
+                        if (c != 0 && isascii(c))
+                        {
+                            stream << (char)c;
+
+                            if (c == ';')
+                                isComment = true;
+
+                            if (isComment == false && c == ':')
+                                stream << std::endl;
+                        }
+                    }
+
+                    stream << std::endl;
+                }
+
+                fclose(pFile);
+            }
+
             return loadFromSPN(fxname, stream.str());
         }
         else
@@ -398,7 +418,7 @@ public:
     {
         log = std::stringstream();
 
-        std::vector<std::vector<int>> fx;
+        std::vector<OP> fx;
         std::string fxcode = spnCode;
 
         this->display = fxname;
@@ -802,7 +822,7 @@ public:
 #ifdef TEST
 int main(int argc, char *argv[])
 {
-    printf("FV1emu\n");
+    printf(";FV1emu\n");
     FV1emu fx;
     int r = !fx.load(argv[1]);
     printf(fx.log.str().c_str());
