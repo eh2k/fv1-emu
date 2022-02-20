@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Test
+      run: |
+        gcc -x c++ ./FV1emu.hpp -o ./test -DTEST -lstdc++
+        chmod +x ./test
+        curl https://raw.githubusercontent.com/eh2k/vcvrack-fv1-emu/master/fx/demo.spn -o demo.spn
+        ./test ./demo.spn
