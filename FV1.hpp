@@ -444,7 +444,7 @@ private:
         else if (flags & SKP_ZRO)
             skip = this->ACC() == 0;
         else if (flags & SKP_GEZ)
-            skip = this->ACC() > 0;
+            skip = this->ACC() >= 0;
         else if (flags & SKP_NEG)
             skip = this->ACC() < 0;
         else if (flags & SKP_ZRC)
