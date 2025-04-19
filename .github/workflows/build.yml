@@ -11,7 +11,7 @@ jobs:
     - uses: actions/checkout@v2
     - name: Test
       run: |
-        gcc -x c++ ./FV1emu.hpp -o ./test -DTEST -lstdc++
+        gcc -x c++ ./FV1emu.hpp -o ./test -DTEST -lstdc++ -lm
         chmod +x ./test
         curl https://raw.githubusercontent.com/eh2k/vcvrack-fv1-emu/master/fx/demo.spn -o demo.spn
         ./test ./demo.spn
