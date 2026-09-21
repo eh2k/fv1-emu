@@ -378,7 +378,7 @@ namespace FV1dasm
             sprintf(p, "JAM %d", a[1]);
             break;
         default:
-            sprintf(p, ";??? %x", a[0]);
+            sprintf(p, ";??? %x", (unsigned)a[0]);
             break;
         }
     }
@@ -461,7 +461,7 @@ namespace FV1dasm
             sprintf(p, "fv1->JAM(%d);", a[1]);
             break;
         default:
-            sprintf(p, ";??? %x", a[0]);
+            sprintf(p, ";??? %x", (unsigned)a[0]);
             break;
         }
         return 0;
@@ -554,64 +554,172 @@ void execute_program(FV1 *fv1)
 
     auto op = (OP *)fv1->rom;
 
+    // ACC, PACC and LR are held in locals for the duration of one program pass.
+    // As members they were reloaded after every single instruction: a store
+    // through an `Reg *` operand may alias `fv1->acc` as far as the compiler can
+    // tell, so each opcode paid a store-to-load forward on the critical path.
+    // Nothing reachable from here reads them through `fv1`, so they only have to
+    // be written back at _OP_END.
+    int32_t acc = fv1->acc.getValue();
+    int32_t pacc = fv1->pacc.getValue();
+    int32_t lr = fv1->lr.getValue();
+
+    // ACC is saturated on every write, so a register receiving it needs no
+    // further clamping - FixedPoint::set(const FixedPoint &) stores it as is.
+#define SAT(v) FixedPoint::sat(v)
+#define ACC_TO(reg) (reg)->set(FixedPoint(acc))
+
 #define DISPATCH() \
     goto * (++op)->label;
 
     goto * op->label;
 
 _OP_RDA:
-    fv1->RDA(op->arg0, op->arg1);
+{
+    pacc = acc;
+    lr = fv1->delay.read(op->arg0);
+    acc = SAT(MUL(lr, op->arg1) + acc);
+}
     DISPATCH();
 _OP_RMPA:
-    fv1->RMPA(op->arg0);
+{
+    pacc = acc;
+    lr = fv1->delay.read(fv1->regs[ADDR_PTR].getValue() >> 8);
+    acc = SAT(acc + SAT(MUL(lr, op->arg0)));
+}
     DISPATCH();
 _OP_WRA:
-    fv1->WRA(op->arg0, op->arg1);
+{
+    pacc = acc;
+    fv1->delay.set(op->arg0, acc);
+    acc = SAT(MUL(acc, op->arg1));
+}
     DISPATCH();
 _OP_WRAP:
-    fv1->WRAP(op->arg0, op->arg1);
+{
+    pacc = acc;
+    fv1->delay.set(op->arg0, acc);
+    acc = SAT(SAT(MUL(acc, op->arg1)) + lr);
+}
     DISPATCH();
 _OP_RDAX:
-    fv1->_RDAX(op->reg0, op->arg1);
+{
+    pacc = acc;
+    acc = SAT(MUL(op->reg0->getValue(), op->arg1) + acc);
+}
     DISPATCH();
 _OP_RDFX:
-    fv1->_RDFX(op->reg0, op->arg1);
+{
+    pacc = acc;
+    int reg = op->reg0->getValue();
+    acc = SAT(MUL(acc - reg, op->arg1) + reg);
+}
     DISPATCH();
 _OP_WRAX:
-    fv1->_WRAX(op->reg0, op->arg1);
+{
+    pacc = acc;
+    ACC_TO(op->reg0);
+    acc = SAT(MUL(acc, op->arg1));
+}
     DISPATCH();
-_OP_WRHX:
-    fv1->_WRHX(op->reg0, op->arg1);
+_OP_WRHX: // ACC->REG[ADDR], (ACC*C) + PACC
+{
+    int prev = pacc;
+    pacc = acc;
+    ACC_TO(op->reg0);
+    acc = SAT(MUL(acc, op->arg1) + prev);
+}
     DISPATCH();
-_OP_WRLX:
-    fv1->_WRLX(op->reg0, op->arg1);
+_OP_WRLX: // ACC->REG[ADDR], (PACC-ACC) * C + PACC
+{
+    int prev = pacc;
+    pacc = acc;
+    ACC_TO(op->reg0);
+    acc = SAT(MUL(prev - acc, op->arg1) + prev);
+}
     DISPATCH();
 _OP_MAXX:
-    fv1->_MAXX(op->reg0, op->arg1);
+{
+    pacc = acc;
+    int reg = op->reg0->getValue();
+    if (reg < 0)
+        reg = -reg;
+    reg = SAT(MUL(reg, op->arg1));
+    if (reg < 0)
+        reg = -reg;
+    int a = acc < 0 ? -acc : acc;
+    acc = SAT(a > reg ? a : reg);
+}
     DISPATCH();
 _OP_MULX:
-    fv1->_MULX(op->reg0);
+{
+    pacc = acc;
+    acc = SAT(MUL(acc, op->reg0->getValue()));
+}
     DISPATCH();
 _OP_LOG:
-    fv1->LOG(op->arg0, op->arg1);
+{
+    pacc = acc;
+    int l;
+    if (acc > 0)
+        l = log2i(acc);
+    else if (acc < 0)
+        l = log2i(-acc);
+    else
+        l = -FixedPoint::MAX;
+    acc = SAT(MUL(l, op->arg0) + op->arg1);
+}
     DISPATCH();
 _OP_EXP:
-    fv1->EXP(op->arg0, op->arg1);
+{
+    pacc = acc;
+    acc = acc >= 0 ? FixedPoint::MAX : SAT(exp2i(acc));
+    acc = SAT(MUL(acc, op->arg0) + op->arg1);
+}
     DISPATCH();
 _OP_SOF:
-    fv1->SOF(op->arg0, op->arg1);
+{
+    pacc = acc;
+    acc = SAT(MUL(acc, op->arg0) + op->arg1);
+}
     DISPATCH();
 _OP_AND:
-    fv1->AND(op->arg0);
+{
+    pacc = acc;
+    acc = SAT(FixedPoint::fixSign(acc & op->arg0));
+}
     DISPATCH();
 _OP_OR:
-    fv1->OR(op->arg0);
+{
+    pacc = acc;
+    acc = SAT(FixedPoint::fixSign(acc | op->arg0));
+}
     DISPATCH();
 _OP_XOR:
-    fv1->XOR(op->arg0);
+{
+    pacc = acc;
+    acc = SAT(FixedPoint::fixSign(acc ^ op->arg0));
+}
     DISPATCH();
 _OP_SKP:
-    op += fv1->SKP(op->arg0, op->arg1);
+{
+    int flags = op->arg0;
+    bool skip = false;
+
+    if (flags & SKP_RUN)
+        skip |= fv1->firstRun == false;
+    if (flags & SKP_ZRO)
+        skip |= acc == 0;
+    if (flags & SKP_GEZ)
+        skip |= acc > 0;
+    if (flags & SKP_NEG)
+        skip |= acc < 0;
+    if (flags & SKP_ZRC)
+        skip |= (acc & FixedPoint::F) != (pacc & FixedPoint::F);
+
+    if (skip)
+        op += op->arg1;
+}
     DISPATCH();
 _OP_WLDS:
     fv1->WLDS(op->arg0, op->arg1, op->arg2);
@@ -620,145 +728,254 @@ _OP_JAM:
     fv1->JAM(op->arg0);
     DISPATCH();
 _OP_CHO_RDA:
-    fv1->CHO_RDA(op->arg0, op->arg1, op->arg2);
+{
+    int lfoval = 0;
+    int scale = 0;
+    fv1->CHO(op->arg0, op->arg1, &lfoval, &scale);
+
+    int addr = op->arg2;
+    if ((op->arg1 & CHO_NA) == 0)
+        addr += (lfoval >> 10);
+
+    pacc = acc;
+    lr = fv1->delay.read(addr);
+    acc = SAT(MUL(lr, scale) + acc);
+}
     DISPATCH();
 _OP_WLDR:
     fv1->WLDR(op->arg0, op->arg1, op->arg2);
     DISPATCH();
 _OP_CHO_RDAL:
-    fv1->CHO_RDAL(op->arg0);
+{
+    pacc = acc;
+    acc = SAT(fv1->CHO_RDAL_VALUE(op->arg0));
+}
     DISPATCH();
 _OP_CHO_SOF:
-    fv1->CHO_SOF(op->arg0, op->arg1, op->arg2);
+{
+    int lfoval = 0;
+    int scale = 0;
+    fv1->CHO(op->arg0, op->arg1, &lfoval, &scale);
+
+    pacc = acc;
+    acc = SAT(MUL(acc, scale) + op->arg2);
+}
     DISPATCH();
 _OP_NOP:
     DISPATCH();
 _OP_END:
+    fv1->acc.set(FixedPoint(acc));
+    fv1->pacc.set(FixedPoint(pacc));
+    fv1->lr.set(FixedPoint(lr));
     return;
 _OP_SOF_SET:
-    fv1->acc.set(op->arg1);
+    acc = SAT(op->arg1);
     DISPATCH();
 _OP_SOF_ADD:
-    fv1->acc.add(op->arg1);
+    acc = SAT(acc + op->arg1);
     DISPATCH();
 _OP_SOF_MUL:
-    fv1->acc.mul(op->arg0);
+    acc = SAT(MUL(acc, op->arg0));
     DISPATCH();
 _OP_EXP_10:
-    fv1->_EXP();
+{
+    pacc = acc;
+    acc = acc >= 0 ? FixedPoint::MAX : SAT(exp2i(acc));
+}
     DISPATCH();
 _OP_RDAX_1:
-    fv1->_RDAX(op->reg0);
+{
+    pacc = acc;
+    acc = SAT(acc + op->reg0->getValue());
+}
     DISPATCH();
 _OP_WRAX_1:
-    fv1->_WRAX(op->reg0);
+{
+    pacc = acc;
+    ACC_TO(op->reg0);
+}
     DISPATCH();
 _OP_WRAX_RDAX:
-    op->reg0->set(fv1->ACC());
-    fv1->acc.set(FixedPoint::mul(op->reg1->getValue(), op->arg2));
+{
+    ACC_TO(op->reg0);
+    acc = SAT(MUL(op->reg1->getValue(), op->arg2));
+}
     DISPATCH();
 _OP_LDAX:
-    fv1->_LDAX(op->reg0);
+{
+    pacc = acc;
+    acc = op->reg0->getValue();
+}
     DISPATCH();
+
+#undef SAT
+#undef ACC_TO
+#undef DISPATCH
 }
 
+// Translates the 128-word FV-1 ROM image into the threaded-code form executed by
+// execute_program(). Besides the per-opcode specializations (D_OP_*) the loader
+// folds instruction sequences that provably cannot be observed:
+//
+//  * a run of all-zero words (`RDA 0,0`) - what SPINAsm pads unused program
+//    space with - is idempotent: each one re-reads the same delay cell into LR,
+//    copies ACC to PACC and leaves ACC untouched. Executing it once is
+//    indistinguishable from executing it 117 times, so a run collapses to one op.
+//  * `WRAX reg,0` followed by `RDAX reg2,c` becomes a single fused op.
+//
+// Both change instruction indices, so SKP offsets are remapped afterwards.
 extern "C" void *fv1_load(FV1 *fv1, const uint8_t *prog, void *(*malloc)(size_t size))
 {
     if (malloc == nullptr)
         malloc = ::malloc;
 
-    uint32_t *p = (uint32_t *)prog;
     auto fx = (OP *)malloc(sizeof(OP) * 129);
     fv1->rom = fx;
 
     execute_program(nullptr);
 
-    int j = 0;
-    if (prog != nullptr)
+    if (prog == nullptr)
     {
-        for (int a = 0; a < 512; a += 4)
-        {
-            uint32_t i = 0;
-            i |= prog[a] << 24;
-            i |= prog[a + 1] << 16;
-            i |= prog[a + 2] << 8;
-            i |= prog[a + 3] << 0;
-
-            if (i == 0x11)
-                break;
-
-            int32_t instr[4] = {};
-            FV1dasm::dasmOP(i, instr);
-
-            if (instr[0] == OP_WLDR)
-                instr[0] = D_OP_WLDR;
-            else if (instr[0] == OP_CHO_SOF)
-                instr[0] = D_OP_CHO_SOF;
-            else if (instr[0] == OP_CHO_RDAL)
-                instr[0] = D_OP_CHO_RDAL;
-            else if (instr[0] == OP_SOF)
-            {
-                if (instr[1] == 0)
-                    instr[0] = D_OP_SOF_SET;
-                else if (instr[1] == 8388608)
-                    instr[0] = D_OP_SOF_ADD;
-                else if (instr[2] == 0)
-                    instr[0] = D_OP_SOF_MUL;
-            }
-            else if (instr[0] == OP_EXP)
-            {
-                if (instr[1] == 8388608 && instr[2] == 0)
-                    instr[0] = D_OP_EXP_10;
-            }
-            else if (instr[0] == OP_RDAX && instr[2] == 8388608)
-            {
-                instr[0] = D_OP_RDAX_1;
-            }
-            else if (instr[0] == OP_WRAX && instr[2] == 8388608)
-            {
-                instr[0] = D_OP_WRAX_1;
-            }
-            else if (instr[0] == OP_RDAX)
-            {
-                if (fx[j - 1].label == _dispatch_table[OP_WRAX] && fx[j - 1].arg1 == 0)
-                {
-                    fx[j - 1].label = _dispatch_table[D_OP_WRAX_RDAX];
-                    fx[j - 1].reg1 = &fv1->regs[instr[1]];
-                    fx[j - 1].arg2 = instr[2];
-                    continue;
-                }
-            }
-            else if (instr[0] == OP_RDFX && instr[2] == 0)
-            {
-                instr[0] = D_OP_LDAX;
-            }
-
-            fx[j++] = {_dispatch_table[instr[0]], instr[1], instr[2], instr[3]};
-
-            switch (instr[0])
-            {
-            case D_OP_LDAX:
-            case OP_RDAX:
-            case D_OP_RDAX_1:
-            case OP_WRAX:
-            case D_OP_WRAX_1:
-            case OP_MULX:
-            case OP_RDFX:
-            case OP_WRHX:
-            case OP_WRLX:
-            case OP_MAXX:
-                fx[j - 1].reg0 = &fv1->regs[instr[1]];
-                break;
-            }
-        }
-    }
-    else
-    {
+        int j = 0;
         while (j < 128)
-            fx[j++] = {_dispatch_table[D_OP_NOP], 0, 0, 0}; //_OP_NOP
+            fx[j++] = OP{_dispatch_table[D_OP_NOP], 0, 0, 0}; //_OP_NOP
+        fx[j] = OP{_dispatch_table[D_OP_END], 0, 0, 0};       //_OP_END
+        fv1->setFx(execute_program);
+        return fv1->rom;
     }
 
-    fx[j] = {_dispatch_table[D_OP_END], 0, 0, 0}; //_OP_END
+    uint8_t kind[128];     // dispatch index per source instruction
+    uint8_t emitKind[128]; // dispatch index per emitted instruction
+    bool pad[128];         // source word was all zero (`RDA 0,0`)
+    bool target[129];      // source index is reachable by a SKP
+    int16_t src[128];      // emitted index -> source index
+    int16_t newIdx[129];   // source index -> emitted index
+
+    int n = 0;
+    for (int a = 0; a < 512; a += 4)
+    {
+        uint32_t i = 0;
+        i |= prog[a] << 24;
+        i |= prog[a + 1] << 16;
+        i |= prog[a + 2] << 8;
+        i |= prog[a + 3] << 0;
+
+        if (i == 0x11)
+            break;
+
+        int32_t instr[4] = {};
+        FV1dasm::dasmOP(i, instr);
+
+        uint32_t k = (uint32_t)instr[0];
+        if (k == OP_WLDR)
+            k = D_OP_WLDR;
+        else if (k == OP_CHO_SOF)
+            k = D_OP_CHO_SOF;
+        else if (k == OP_CHO_RDAL)
+            k = D_OP_CHO_RDAL;
+        else if (k == OP_SOF)
+        {
+            if (instr[1] == 0)
+                k = D_OP_SOF_SET;
+            else if (instr[1] == FixedPoint::F)
+                k = D_OP_SOF_ADD;
+            else if (instr[2] == 0)
+                k = D_OP_SOF_MUL;
+        }
+        else if (k == OP_EXP)
+        {
+            if (instr[1] == FixedPoint::F && instr[2] == 0)
+                k = D_OP_EXP_10;
+        }
+        else if (k == OP_RDAX && instr[2] == FixedPoint::F)
+            k = D_OP_RDAX_1;
+        else if (k == OP_WRAX && instr[2] == FixedPoint::F)
+            k = D_OP_WRAX_1;
+        else if (k == OP_RDFX && instr[2] == 0)
+            k = D_OP_LDAX;
+
+        kind[n] = (uint8_t)k;
+        pad[n] = (i == 0);
+        target[n] = false;
+        fx[n] = OP{nullptr, instr[1], instr[2], instr[3]};
+        ++n;
+    }
+    target[n] = false;
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (kind[i] != OP_SKP)
+            continue;
+        int t = i + fx[i].arg1 + 1;
+        target[t > n ? n : t] = true;
+    }
+
+    int j = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        // continuation of a run of `RDA 0,0` - already covered by the run's head.
+        // Entering the run halfway is fine too: one execution equals any number.
+        if (pad[i] && i > 0 && pad[i - 1])
+        {
+            newIdx[i] = (int16_t)(j - 1);
+            continue;
+        }
+
+        // WRAX reg,0 + RDAX reg2,c. Only foldable while nothing branches onto the
+        // RDAX - otherwise the jump would start running the WRAX as well.
+        if (kind[i] == OP_RDAX && !target[i] && j > 0 &&
+            emitKind[j - 1] == OP_WRAX && fx[j - 1].arg1 == 0)
+        {
+            emitKind[j - 1] = D_OP_WRAX_RDAX;
+            fx[j - 1].reg1 = &fv1->regs[fx[i].arg0];
+            fx[j - 1].arg2 = fx[i].arg1;
+            newIdx[i] = (int16_t)(j - 1);
+            continue;
+        }
+
+        newIdx[i] = (int16_t)j;
+        src[j] = (int16_t)i;
+        emitKind[j] = kind[i];
+        if (j != i)
+            fx[j] = fx[i];
+        ++j;
+    }
+    newIdx[n] = (int16_t)j; // falling off the end lands on _OP_END
+
+    for (int d = 0; d < j; ++d)
+    {
+        if (emitKind[d] != OP_SKP)
+            continue;
+        int t = src[d] + fx[d].arg1 + 1;
+        fx[d].arg1 = newIdx[t > n ? n : t] - d - 1;
+    }
+
+    for (int d = 0; d < j; ++d)
+    {
+        switch (emitKind[d])
+        {
+        case D_OP_LDAX:
+        case OP_RDAX:
+        case D_OP_RDAX_1:
+        case OP_WRAX:
+        case D_OP_WRAX_1:
+        case D_OP_WRAX_RDAX:
+        case OP_MULX:
+        case OP_RDFX:
+        case OP_WRHX:
+        case OP_WRLX:
+        case OP_MAXX:
+        {
+            int reg = fx[d].arg0;
+            fx[d].reg0 = &fv1->regs[reg];
+            break;
+        }
+        }
+
+        fx[d].label = _dispatch_table[emitKind[d]];
+    }
+
+    fx[j] = OP{_dispatch_table[D_OP_END], 0, 0, 0}; //_OP_END
 
     fv1->setFx(execute_program);
     return fv1->rom;

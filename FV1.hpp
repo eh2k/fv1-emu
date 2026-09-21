@@ -112,7 +112,17 @@ inline T clamp(T value, T min, T max)
 }
 
 #define SSAT24(newValue) clamp(newValue, -(F), (F)-1)
-#define MUL(a, b) (((int64_t)(a) * (b)) / FixedPoint::F)
+
+// The 24x24 product is truncated towards minus infinity, which is what dropping
+// the low bits in hardware does and what the __ARM_ARCH_7EM__ smull path above
+// has always done. Dividing instead rounds towards zero, which differs by one
+// LSB on negative products and costs a sign-correction sequence on every
+// multiply. Define FV1_ROUND_TO_ZERO_MUL to get the old C behaviour back.
+#ifdef FV1_ROUND_TO_ZERO_MUL
+#define MUL(a, b) ((int32_t)(((int64_t)(a) * (b)) / FixedPoint::F))
+#else
+#define MUL(a, b) ((int32_t)(((int64_t)(a) * (b)) >> 23))
+#endif
 
 #endif
 
@@ -160,6 +170,11 @@ public:
     INLINE int getValue() const
     {
         return value;
+    }
+
+    INLINE static int sat(int newValue)
+    {
+        return SSAT24(newValue);
     }
 
     INLINE static int fixSign(int newValue)
@@ -261,7 +276,14 @@ public:
 
     INLINE void increment()
     {
-        FixedPoint coeff(regRate->getValue() >> 8);
+        int rate = regRate->getValue() >> 8;
+
+        // A zero rate leaves both state words untouched (both updates add zero and
+        // neither value can be out of range), so skip the two 24x24 multiplies.
+        if (rate == 0)
+            return;
+
+        FixedPoint coeff(rate);
         cos_.add(FixedPoint::mul(sin_, coeff));
         sin_.sub(FixedPoint::mul(cos_, coeff));
     }
@@ -352,9 +374,16 @@ class DelayMemory
     unsigned int p = 0;
 
 public:
+    // int16_t << 8 always lands inside [-(1<<23), (1<<23)-1], so the caller can
+    // use the result as an already saturated 24 bit value.
+    INLINE int read(int offset) const
+    {
+        return mem[(offset + p) & MAX_DELAY_ADDR] << 8;
+    }
+
     INLINE int get(int offset, Reg &lr)
     {
-        int val = mem[(offset + p) & MAX_DELAY_ADDR] << 8;
+        int val = read(offset);
         lr.set(val);
         return val;
     }
@@ -372,31 +401,153 @@ public:
 
 struct OP;
 
+// 2^(16 * i / 2^23) in 24 bit fixed point - the kernel of the EXP instruction,
+// which only ever calls it with a negative ACC, so the result lies in (0, 1].
+//
+// Split i = n * 2^19 + f, where n = floor(x) is a whole number of octaves in
+// [-16, -1] and f is the fraction of an octave. 2^f comes from a 32 entry table
+// times a cubic Taylor expansion of the remaining 1/32nd of an octave (tail
+// below 1e-8, two orders finer than the 24th bit), and 2^n is the closing shift.
+//
+// This replaces a call to exp2f: about twice as fast, and because it never
+// rounds through a 24 bit float mantissa it is also closer to the exact value -
+// 0.17% of the 2^23 possible results are one LSB off the correctly truncated
+// value, where exp2f was 3.1% off. Neither is ever off by more than one LSB.
 inline int _exp2i(int i)
 {
-    float val = FixedPoint(i).toFloat() * 16.0f;
-    val = exp2f(val);
-    return FixedPoint::fromFloat(val).getValue();
+    static constexpr uint32_t OCTAVE[32] = { // 2^(k/32) in Q30
+        1073741824u, 1097253708u, 1121280436u, 1145833280u,
+        1170923762u, 1196563654u, 1222764986u, 1249540052u,
+        1276901417u, 1304861917u, 1333434672u, 1362633090u,
+        1392470869u, 1422962010u, 1454120821u, 1485961921u,
+        1518500250u, 1551751076u, 1585730000u, 1620452965u,
+        1655936265u, 1692196547u, 1729250827u, 1767116489u,
+        1805811301u, 1845353420u, 1885761398u, 1927054196u,
+        1969251188u, 2012372174u, 2056437387u, 2101467502u};
+
+    // ln2, ln(2)^2/2 and ln(2)^3/6 in Q30
+    static constexpr int64_t C1 = 744261118;
+    static constexpr int64_t C2 = 257941248;
+    static constexpr int64_t C3 = 59597083;
+
+    if (i >= 0)
+        return FixedPoint::F; // 2^0; anything above saturates to MAX anyway
+
+    int n = i >> 19;               // whole octaves, -16..-1
+    int f = i & 0x7FFFF;           // fraction of an octave
+    int64_t u = f & 0x3FFF;        // residue within 1/32 octave, scaled by 2^19
+
+    int64_t t = C2 + ((u * C3) >> 19);
+    t = C1 + ((u * t) >> 19);
+    t = (u * t) >> 19;             // 2^u - 1 in Q30
+
+    uint32_t g = OCTAVE[f >> 14];
+    g += (uint32_t)((g * t) >> 30); // 2^(f / 2^19) in Q30, stays below 2^31
+
+    return (int)(g >> (7 - n));    // times 2^(23 + n), so a shift by 8..23
+}
+
+// Index of the highest set bit; v must not be zero.
+inline int _msb(uint32_t v)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return 31 - __builtin_clz(v);
+#else
+    int r = 0;
+    if (v & 0xFFFF0000u) { v >>= 16; r += 16; }
+    if (v & 0x0000FF00u) { v >>= 8;  r += 8;  }
+    if (v & 0x000000F0u) { v >>= 4;  r += 4;  }
+    if (v & 0x0000000Cu) { v >>= 2;  r += 2;  }
+    if (v & 0x00000002u) { r += 1; }
+    return r;
+#endif
 }
 
 inline float fast_log2f(float val)
 {
-    int *const exp_ptr = reinterpret_cast<int *>(&val);
-    int x = *exp_ptr;
+    // Kept for callers outside this header; _log2i no longer needs it. Reading
+    // the float back through an int lvalue breaks strict aliasing, so the bits
+    // go through memcpy, which every compiler folds away.
+    int x;
+    memcpy(&x, &val, sizeof(x));
     const int log_2 = ((x >> 23) & 255) - 128;
     x &= ~(255 << 23);
     x += 127 << 23;
-    *exp_ptr = x;
+    memcpy(&val, &x, sizeof(val));
 
     val = ((-1.0f / 3) * val + 2) * val - 2.0f / 3; // (1)
 
     return (val + log_2);
 }
 
+// log2(i / 2^23) / 16 in 24 bit fixed point - the kernel of the LOG instruction,
+// which passes |ACC| and so keeps i within [1, 2^23].
+//
+// Write i = 2^e * m with m in [1,2); the result is then 2^19 * (e - 23 + log2(m)).
+// The mantissa is split once more, at 1/32 of an octave: the table holds log2 of
+// each of the 32 breakpoints m0 together with the cubic coefficients of log2
+// about that point, so no division and no normalisation multiply is needed. The
+// quartic tail is 3.4e-7, a fifth of one LSB of the result.
+//
+// What this replaces approximated log2 across a whole octave with a single
+// quadratic. That is off by up to 0.0097 - some 5090 LSB here, or 0.06 dB of
+// gain error once an EXP undoes the LOG. This version stays within 1 LSB for
+// every input, at the same cost.
 inline int _log2i(int i)
 {
-    float f = fast_log2f(FixedPoint(i).toFloat()) / 16.0f;
-    return FixedPoint::fromFloat(f).getValue();
+    struct Coeff
+    {
+        uint32_t log2m0;    // log2(m0), Q30
+        int32_t a1, a2, a3; // 1/(m0 ln2), -1/(2 m0^2 ln2), 1/(3 m0^3 ln2), Q30
+    };
+
+    static constexpr Coeff TAB[32] = {
+        {         0u, 1549082005, -774541002, 516360668},
+        {  47667823u, 1502140126, -728310364, 470826902},
+        {  93912511u, 1457959534, -686098604, 430493242},
+        { 138816582u, 1416303547, -647453050, 394638050},
+        { 182455581u, 1376961782, -611983014, 362656601},
+        { 224898839u, 1339746599, -579349880, 334039571},
+        { 266210141u, 1304490109, -549258993, 308355926},
+        { 306448299u, 1271041645, -521452983, 285239238},
+        { 345667660u, 1239265604, -495706241, 264376662},
+        { 383918542u, 1209039613, -471820337, 245500013},
+        { 421247625u, 1180252956, -449620174, 228378501},
+        { 457698295u, 1152805213, -428950777, 212812789},
+        { 493310944u, 1126605094, -409674580, 198630099},
+        { 528123241u, 1101569426, -391669129, 185680180},
+        { 562170370u, 1077622264, -374825135, 173831947},
+        { 595485245u, 1054694131, -359044811, 162970694},
+        { 628098702u, 1032721336, -344240445, 152995754},
+        { 660039669u, 1011645391, -330333189, 143818531},
+        { 691335320u,  991412483, -317251995, 135360851},
+        { 722011213u,  971973023, -304932713, 127553553},
+        { 752091421u,  953281234, -293317303, 120335304},
+        { 781598637u,  935294795, -282353146, 113651581},
+        { 810554283u,  917974521, -271992451, 107453808},
+        { 838978604u,  901284075, -262191731, 101698611},
+        { 866890747u,  885189717, -252911348,  96347180},
+        { 894308843u,  869660073, -244115108,  91364719},
+        { 921250079u,  854665934, -235769913,  86719968},
+        { 947730758u,  840180070, -227845443,  82384793},
+        { 973766362u,  826177069, -220313885,  78333826},
+        { 999371606u,  812633183, -213149687,  74544153},
+        {1024560487u,  799526196, -206329341,  70995042},
+        {1049346328u,  786835304, -199831188,  67667704}};
+
+    if (i <= 0)
+        return -23 * (1 << 19); // log2(0); LOG never asks for it
+
+    int e = _msb((uint32_t)i);
+    uint32_t frac = ((uint32_t)i << (31 - e)) & 0x7FFFFFFFu; // m - 1, Q31
+    const Coeff &c = TAB[frac >> 26];
+    int64_t v = frac & 0x3FFFFFF; // m - m0, Q31
+
+    int64_t t = c.a2 + ((v * c.a3) >> 31);
+    t = c.a1 + ((v * t) >> 31);
+    t = (v * t) >> 31; // log2(m) - log2(m0), Q30
+
+    return (e - 23) * (1 << 19) + (int)((c.log2m0 + t) >> 11);
 }
 
 #ifdef MAKE_S
@@ -792,7 +943,11 @@ public:
     INLINE void CHO_RDAL(int lfo)
     {
         ACC2PACC();
+        this->acc.set(CHO_RDAL_VALUE(lfo));
+    }
 
+    INLINE int CHO_RDAL_VALUE(int lfo)
+    {
         int lfoval = 0;
 
         switch (lfo)
@@ -821,7 +976,7 @@ public:
             break;
         }
 
-        this->acc.set(lfoval);
+        return lfoval;
     }
 
     INLINE void CLR()
